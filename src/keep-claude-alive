@@ -1,0 +1,138 @@
+#!/bin/bash
+# Keeps a Claude subscription usage window continuously open.
+# Reads the real reset time from `claude -p "/usage"`; pings only when no window is open.
+set -uo pipefail
+
+BASE="${HOME}/.keep-claude-alive"
+LOG="${BASE}/keepalive.log"
+TIMEOUT="${KCA_TIMEOUT:-120}"
+COOLDOWN="${KCA_COOLDOWN:-1800}"
+PING_MARK="${BASE}/last-ping"
+
+# launchd gives us a bare PATH; resolve the binary explicitly.
+CLAUDE="${CLAUDE_BIN:-}"
+if [ -z "$CLAUDE" ] || [ ! -x "$CLAUDE" ]; then
+  for c in /opt/homebrew/bin/claude /usr/local/bin/claude \
+           "${HOME}/.claude/local/claude" "${HOME}/.local/bin/claude"; do
+    [ -x "$c" ] && CLAUDE="$c" && break
+  done
+fi
+
+# Trims to the newest 500 lines past 1000, so a persistent failure logging on
+# every tick cannot grow without bound.
+log() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"
+  [ "$(wc -l < "$LOG" 2>/dev/null || echo 0)" -gt 1000 ] || return 0
+  tail -500 "$LOG" > "${LOG}.trim" 2>/dev/null && mv "${LOG}.trim" "$LOG"
+}
+
+touch "${BASE}/last-check" 2>/dev/null
+
+# Bounds the damage if pings stop opening windows: without it the agent would
+# ping on every tick for as long as the condition lasts.
+ping_allowed() {
+  local last=0
+  [ -f "$PING_MARK" ] && last=$(stat -f %m "$PING_MARK" 2>/dev/null || echo 0)
+  [ $(( $(date +%s) - last )) -ge "$COOLDOWN" ]
+}
+
+trunc() { tr '\n' ' ' | cut -c1-250; }
+
+# macOS has no timeout(1); a hung call would otherwise block every later run.
+claude_run() {
+  perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$CLAUDE" "$@" </dev/null 2>&1
+}
+
+# "HH:MM" -> minutes since midnight. 10# forces base 10 so "08" is not octal.
+hhmm() { echo $(( 10#${1%%:*} * 60 + 10#${1##*:} )); }
+
+# Empty or "always" means no restriction. "00:00" as the end means end of day.
+in_active_hours() {
+  local range="${KCA_ACTIVE:-}" from to now
+  [ -z "$range" ] || [ "$range" = "always" ] && return 0
+  from=$(hhmm "${range%%-*}") || return 0
+  to=$(hhmm "${range##*-}")   || return 0
+  [ "$to" -eq 0 ] && to=1440
+  now=$(hhmm "$(date +%H:%M)") || return 0
+  if [ "$from" -le "$to" ]; then
+    [ "$now" -ge "$from" ] && [ "$now" -lt "$to" ]
+  else
+    # Range wraps past midnight, e.g. 22:00-06:00.
+    [ "$now" -ge "$from" ] || [ "$now" -lt "$to" ]
+  fi
+}
+
+# $2 is the IANA zone /usage reported; ignored unless macOS actually knows it,
+# since an unrecognised TZ silently means UTC.
+epoch_in_zone() {
+  if [ -n "$2" ] && [ -f "/usr/share/zoneinfo/$2" ]; then
+    TZ="$2" date -j -f '%b %e %l:%M%p %Y' "$1" +%s 2>/dev/null
+  else
+    date -j -f '%b %e %l:%M%p %Y' "$1" +%s 2>/dev/null
+  fi
+}
+
+# "Sep 3 at 2:30pm" / "Sep 8 at 11pm" -> epoch, or empty if unparseable.
+stamp_to_epoch() {
+  local n y e tz="${2:-}"
+  n=$(echo "$1" | sed 's/ at / /; s/ \([0-9]\{1,2\}\)am$/ \1:00am/; s/ \([0-9]\{1,2\}\)pm$/ \1:00pm/; s/am$/AM/; s/pm$/PM/')
+  y=$(date +%Y)
+  e=$(epoch_in_zone "$n $y" "$tz")
+  # The stamp carries no year; one far in the past belongs to next year.
+  if [ -n "$e" ] && [ "$e" -lt $(( $(date +%s) - 2592000 )) ]; then
+    e=$(epoch_in_zone "$n $(( y + 1 ))" "$tz")
+  fi
+  echo "$e"
+}
+
+if [ -z "$CLAUDE" ] || [ ! -x "$CLAUDE" ]; then
+  log "ERROR claude binary not found or not executable"
+  exit 1
+fi
+
+in_active_hours || exit 0
+
+if ! usage=$(claude_run -p "/usage"); then
+  log "ERROR /usage failed: $(printf '%s' "$usage" | trunc)"
+  exit 1
+fi
+
+# Re-reads /usage to confirm a window actually exists. No `| grep -q` on the
+# live output: grep exiting early SIGPIPEs the writer, which pipefail turns into
+# a false negative.
+window_open() {
+  local u line
+  u=$(claude_run -p "/usage") || return 1
+  line=$(printf '%s\n' "$u" | grep -m1 'Current session:')
+  case "$line" in *"resets "*) return 0 ;; esac
+  return 1
+}
+
+session=$(printf '%s\n' "$usage" | grep -m1 'Current session:')
+
+# A session line without a "resets" clause means no window is open; one whose
+# clause will not parse means the format changed, so leave it alone.
+if [ -n "$session" ] && printf '%s' "$session" | grep -q 'resets '; then
+  stamp=$(printf '%s\n' "$session" | sed -n 's/.*resets \(.*\) (.*/\1/p')
+  zone=$(printf '%s\n' "$session" | sed -n 's/.*(\([^)]*\)).*/\1/p')
+  reset=$(stamp_to_epoch "$stamp" "$zone")
+  if [ -z "$stamp" ] || [ -z "$reset" ]; then
+    log "WARN unparseable reset time, assuming window open: $(printf '%s' "$session" | trunc)"
+    exit 0
+  fi
+  [ "$(date +%s)" -lt "$reset" ] && exit 0
+fi
+
+ping_allowed || exit 0
+touch "$PING_MARK" 2>/dev/null
+
+out=$(claude_run -p "hi" --model haiku)
+# claude exits 0 even when it refuses, so judge the reply, not the status.
+if [ -z "$out" ] || printf '%s' "$out" | grep -qiE 'not logged in|please run /login|invalid api key|usage limit|rate limit'; then
+  log "ping FAILED: $(printf '%s' "$out" | trunc)"
+elif window_open; then
+  log "ping ok - window reopened"
+else
+  # A reply that opens no window is the failure that looks like success.
+  log "ping ANSWERED BUT NO WINDOW OPENED - reply was: $(printf '%s' "$out" | trunc)"
+fi

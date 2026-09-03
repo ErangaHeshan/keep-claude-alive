@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.keep-claude-alive</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__APP__/Contents/MacOS/Keep Claude Alive</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CLAUDE_BIN</key>
+        <string>__CLAUDE__</string>
+        <key>KCA_ACTIVE</key>
+        <string>__ACTIVE__</string>
+    </dict>
+    <key>StartInterval</key>
+    <integer>__INTERVAL__</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardErrorPath</key>
+    <string>__BASE__/launchd.err</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

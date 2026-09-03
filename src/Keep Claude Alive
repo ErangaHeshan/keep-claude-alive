@@ -1,0 +1,3 @@
+#!/bin/bash
+# Launcher only: its filename is what macOS shows in Login Items & Extensions.
+exec "$(dirname "$0")/keep-claude-alive" "$@"
